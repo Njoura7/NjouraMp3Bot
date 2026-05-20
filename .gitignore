@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment variables — contains Discord token, YouTube cookies, etc.
+.env
+.env.local
+.env.*.local
+
+# yt-dlp binary (downloaded automatically by yt-dlp-exec on npm install)
+yt-dlp
+yt-dlp.exe
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+
+# Build / cache
+dist/
+.cache/

@@ -1,0 +1,25 @@
+{
+  "name": "discord-music-bot",
+  "version": "1.0.0",
+  "description": "Minimal Discord bot that plays audio from a URL with a clean embed UI.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@distube/ytdl-core": "^4.16.12",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.8.4",
+    "opusscript": "^0.1.1",
+    "play-dl": "^1.9.7",
+    "yt-dlp-exec": "^1.0.2"
+  }
+}
