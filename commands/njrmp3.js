@@ -20,7 +20,7 @@ import play from 'play-dl';
 import ytDlp from 'yt-dlp-exec';
 
 export const data = new SlashCommandBuilder()
-  .setName('play')
+  .setName('njrmp3')
   .setDescription('Play audio in your voice channel')
   .addStringOption((opt) =>
     opt
@@ -194,35 +194,42 @@ export async function execute(interaction, client) {
   client.players.set(interaction.guildId, { player, connection, trackTitle, trackUrl: url });
 
   player.once(AudioPlayerStatus.Idle, () => {
+    console.log(`[PLAYER] ${interaction.guildId} track ended (Idle)`);
     try { connection.destroy(); } catch {}
     client.players.delete(interaction.guildId);
   });
 
   player.on('error', (err) => {
-    console.error('Player error:', err);
+    console.error(`[PLAYER] ${interaction.guildId} error:`, err);
     try { connection.destroy(); } catch {}
     client.players.delete(interaction.guildId);
   });
 
   // --- Now Playing embed ---
+  const validUrl = /^https?:\/\//.test(url) ? url : null;
+
   const embed = new EmbedBuilder()
-    .setColor(0x9b59b6)
-    .setAuthor({ name: '🎶  Now Playing' })
+    .setColor(0x7C3AED)
+    .setAuthor({ name: '◈  njrMP3' })
     .setTitle(trackTitle)
-    .setURL(/^https?:\/\//.test(url) ? url : null)
-    .setDescription(`Channel · **${voiceChannel.name}**`)
+    .setURL(validUrl)
+    .setDescription(
+      `**▶  Now Streaming**\n` +
+      `╰  \`${voiceChannel.name}\`\n\n` +
+      `\`▬▬▬◉─────────────────────\``,
+    )
     .setFooter({
-      text: `Requested by ${member.user.username}`,
+      text: `✦ NJR  ·  ${member.user.username}`,
       iconURL: member.user.displayAvatarURL(),
     })
     .setTimestamp();
 
-  if (thumbnail) embed.setThumbnail(thumbnail);
+  if (thumbnail) embed.setImage(thumbnail);
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('resume').setEmoji('▶️').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setLabel('Pause').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('resume').setEmoji('▶️').setLabel('Resume').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setLabel('Stop').setStyle(ButtonStyle.Danger),
   );
 
   await interaction.editReply({ embeds: [embed], components: [row] });
