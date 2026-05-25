@@ -15,6 +15,12 @@ if (process.env.YOUTUBE_COOKIE) {
   console.log('✅ YouTube cookie loaded');
 }
 
+// play-dl requires a SoundCloud client ID before so_validate / play.stream will work.
+// getFreeClientID() scrapes a working one from soundcloud.com — no account needed.
+const scClientId = await play.getFreeClientID();
+await play.setToken({ soundcloud: { client_id: scClientId } });
+console.log('✅ SoundCloud client ID fetched');
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });

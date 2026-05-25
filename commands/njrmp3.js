@@ -102,8 +102,7 @@ export async function execute(interaction, client) {
   let resource;
   try {
     if (isYT) {
-      // yt-dlp: the only tool that reliably handles YouTube's bot detection.
-      // Prefer webm/opus so @discordjs/voice can use it without ffmpeg transcoding.
+      // Step 1 — metadata only (fast JSON probe, no audio download)
       const info = await ytDlp(url, {
         dumpSingleJson: true,
         noWarnings: true,
@@ -112,26 +111,44 @@ export async function execute(interaction, client) {
         format: 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio',
       });
 
-      // Always use yt-dlp's own metadata — more accurate than search snippets
       trackTitle = info.title ?? trackTitle;
       thumbnail = info.thumbnail ?? thumbnail;
 
-      // webm/opus can be sent to Discord as-is (no CPU-heavy ffmpeg re-encode)
+      // Step 2 — pipe audio directly through yt-dlp's stdout.
+      // info.url is a signed CDN URL that expires after a few minutes; for long
+      // videos / podcasts Discord's HTTP client hits that deadline mid-stream and
+      // the player silently fires Idle. Piping keeps yt-dlp owning the connection
+      // for the full duration so the URL never expires underneath us.
       const isNativeOpus = info.ext === 'webm' && info.acodec === 'opus';
-      resource = createAudioResource(info.url, {
+      const ytProc = ytDlp.exec(url, {
+        output: '-',              // write audio bytes to stdout
+        format: info.format_id,  // pin to the exact format already selected above
+        noPlaylist: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+      });
+      resource = createAudioResource(ytProc.stdout, {
         inputType: isNativeOpus ? StreamType.WebmOpus : StreamType.Arbitrary,
       });
 
     } else if (isSC) {
-      // SoundCloud via play-dl (still works reliably)
-      try {
-        const scInfo = await play.soundcloud(url);
-        trackTitle = scInfo.name ?? trackTitle;
-        thumbnail = scInfo.thumbnail ?? null;
-      } catch { /* metadata is optional */ }
+      // Same two-step pattern for SoundCloud — avoids any CDN URL expiry.
+      const info = await ytDlp(url, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        format: 'bestaudio',
+      });
+      trackTitle = info.title ?? trackTitle;
+      thumbnail = info.thumbnail ?? thumbnail;
 
-      const stream = await play.stream(url);
-      resource = createAudioResource(stream.stream, { inputType: stream.type });
+      const scProc = ytDlp.exec(url, {
+        output: '-',
+        format: info.format_id,
+        noWarnings: true,
+        noCheckCertificates: true,
+      });
+      resource = createAudioResource(scProc.stdout, { inputType: StreamType.Arbitrary });
 
     } else {
       // Direct audio URL (mp3, ogg, m4a, …)
