@@ -307,6 +307,9 @@ export async function execute(interaction, client) {
   // ── If already playing: append to queue, keep current song running ──────────
   const existing = client.players.get(interaction.guildId);
   if (existing) {
+    const playAfter = existing.queue.length > 0
+      ? existing.queue[existing.queue.length - 1].title
+      : existing.current?.title ?? '…';
     existing.queue.push(...tracks);
 
     // Update the live now-playing embed to reflect the updated queue
@@ -328,8 +331,8 @@ export async function execute(interaction, client) {
           .setTitle(count === 1 ? tracks[0].title : `${count} tracks added`)
           .setDescription(
             (count === 1
-              ? `**📋  Added to Queue**\n╰  Will play after current song`
-              : `**📋  Added to Queue**\n╰  ${count} tracks added at the end`) +
+              ? `**📋  Added to Queue**\n╰  Will play after **${playAfter}**`
+              : `**📋  Added to Queue**\n╰  ${count} tracks will play after **${playAfter}**`) +
             `\n\n▶  Now playing: **${existing.current?.title ?? '…'}**`,
           )
           .setFooter({ text: `✦ NJR  ·  ${member.user.username}`, iconURL: member.user.displayAvatarURL() })
