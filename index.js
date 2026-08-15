@@ -78,4 +78,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
+async function shutdownBot(signal) {
+  console.log(`\n[SHUTDOWN] Received ${signal}. Cleaning up voice connections...`);
+
+  for (const state of client.players.values()) {
+    try { state.player?.stop(true); } catch {}
+    try { state.connection?.destroy(); } catch {}
+  }
+
+  client.players.clear();
+
+  try {
+    await client.destroy();
+  } catch (err) {
+    console.error('[SHUTDOWN] Failed to destroy client cleanly:', err);
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdownBot('SIGINT'));
+process.on('SIGTERM', () => shutdownBot('SIGTERM'));
+
 client.login(process.env.DISCORD_TOKEN);

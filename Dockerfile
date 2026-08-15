@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:24-alpine
 
 # ffmpeg-static ships its own binary, but Alpine needs libc6-compat to run it
 RUN apk add --no-cache libc6-compat python3 make g++

@@ -73,6 +73,15 @@ function buildRow(queueSize) {
   );
 }
 
+function clearGuildState(client, guildId) {
+  const state = client.players.get(guildId);
+  if (!state) return;
+
+  try { state.player?.stop(true); } catch {}
+  try { state.connection?.destroy(); } catch {}
+  client.players.delete(guildId);
+}
+
 // ── Audio resource factory ────────────────────────────────────────────────────
 
 async function createResource(track) {
@@ -143,8 +152,7 @@ async function playNext(guildId, client) {
 
   if (!next) {
     // Queue exhausted — leave channel and mark embed as finished
-    try { state.connection.destroy(); } catch {}
-    client.players.delete(guildId);
+    clearGuildState(client, guildId);
     if (state.nowPlayingMessage) {
       try {
         await state.nowPlayingMessage.edit({
@@ -306,18 +314,23 @@ export async function execute(interaction, client) {
 
   // ── If already playing: append to queue, keep current song running ──────────
   const existing = client.players.get(interaction.guildId);
-  if (existing) {
-    const playAfter = existing.queue.length > 0
-      ? existing.queue[existing.queue.length - 1].title
-      : existing.current?.title ?? '…';
-    existing.queue.push(...tracks);
+  if (existing && existing.connection?.destroyed) {
+    clearGuildState(client, interaction.guildId);
+  }
+
+  const activeState = client.players.get(interaction.guildId);
+  if (activeState) {
+    const playAfter = activeState.queue.length > 0
+      ? activeState.queue[activeState.queue.length - 1].title
+      : activeState.current?.title ?? '…';
+    activeState.queue.push(...tracks);
 
     // Update the live now-playing embed to reflect the updated queue
-    if (existing.nowPlayingMessage) {
+    if (activeState.nowPlayingMessage) {
       try {
-        await existing.nowPlayingMessage.edit({
-          embeds: [buildEmbed(existing)],
-          components: [buildRow(existing.queue.length)],
+        await activeState.nowPlayingMessage.edit({
+          embeds: [buildEmbed(activeState)],
+          components: [buildRow(activeState.queue.length)],
         });
       } catch {}
     }
@@ -333,7 +346,7 @@ export async function execute(interaction, client) {
             (count === 1
               ? `**📋  Added to Queue**\n╰  Will play after **${playAfter}**`
               : `**📋  Added to Queue**\n╰  ${count} tracks will play after **${playAfter}**`) +
-            `\n\n▶  Now playing: **${existing.current?.title ?? '…'}**`,
+            `\n\n▶  Now playing: **${activeState.current?.title ?? '…'}**`,
           )
           .setFooter({ text: `✦ NJR  ·  ${member.user.username}`, iconURL: member.user.displayAvatarURL() })
           .setTimestamp(),
@@ -361,9 +374,12 @@ export async function execute(interaction, client) {
     selfMute: false,
   });
 
-  connection.on('stateChange', (old, next) =>
-    console.log(`[VOICE] ${interaction.guildId} ${old.status} -> ${next.status}`),
-  );
+  connection.on('stateChange', (old, next) => {
+    console.log(`[VOICE] ${interaction.guildId} ${old.status} -> ${next.status}`);
+    if (next.status === VoiceConnectionStatus.Destroyed) {
+      client.players.delete(interaction.guildId);
+    }
+  });
   connection.on('error', (err) =>
     console.error(`[VOICE] ${interaction.guildId} error:`, err),
   );
