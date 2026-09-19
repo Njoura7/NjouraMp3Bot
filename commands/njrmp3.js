@@ -63,6 +63,55 @@ function ytCookieFlags() {
   return file ? { cookies: file } : {};
 }
 
+// Different YouTube "player clients" expose different format sets and are
+// gated by YouTube's bot-detection differently — a client that gets "Sign in
+// to confirm you're not a bot" (common from shared/datacenter IPs like free
+// hosting tiers) often still works through another. Try a short list before
+// giving up; the winning strategy is reused for the actual download so the
+// two requests stay consistent.
+const YT_CLIENT_STRATEGIES = [
+  { format: 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio' },
+  { format: 'bestaudio', extractorArgs: 'youtube:player_client=ios' },
+  { format: 'bestaudio', extractorArgs: 'youtube:player_client=web' },
+  { format: 'bestaudio', extractorArgs: 'youtube:player_client=tv' },
+];
+
+// startIndex lets a retry resume the rotation from where the *previous*
+// attempt's download actually failed, rather than always restarting at 0 —
+// metadata can succeed on strategy 0 while the download itself still 403s,
+// and simply re-trying would hit that same dead end every time.
+async function fetchYoutubeInfo(url, startIndex = 0) {
+  let lastErr;
+  for (let i = 0; i < YT_CLIENT_STRATEGIES.length; i++) {
+    const strategy = YT_CLIENT_STRATEGIES[(startIndex + i) % YT_CLIENT_STRATEGIES.length];
+    try {
+      const info = await ytDlp(url, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        noPlaylist: true,
+        ...strategy,
+        ...ytCookieFlags(),
+      });
+      return { info, strategy };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+async function searchYoutube(query) {
+  const { info } = await fetchYoutubeInfo(`ytsearch1:${query}`);
+  const hit = info.entries?.[0];
+  if (!hit) return null;
+  return {
+    url: hit.webpage_url ?? `https://www.youtube.com/watch?v=${hit.id}`,
+    title: hit.title ?? query,
+    thumbnail: hit.thumbnail ?? hit.thumbnails?.at(-1)?.url ?? null,
+  };
+}
+
 export const data = new SlashCommandBuilder()
   .setName('njrmp3')
   .setDescription('Play audio in your voice channel')
@@ -234,20 +283,14 @@ async function createResource(track) {
   const isSC = hostname === 'soundcloud.com';
 
   if (isYT) {
-    const info = await ytDlp(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      noCheckCertificates: true,
-      noPlaylist: true,
-      format: 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio',
-      ...ytCookieFlags(),
-    });
+    const { info, strategy } = await fetchYoutubeInfo(url, track._strategyIndex ?? 0);
     if (!track.title || track.title === 'Unknown Track') track.title = info.title ?? track.title;
     if (!track.thumbnail) track.thumbnail = info.thumbnail ?? null;
 
     const isNativeOpus = info.ext === 'webm' && info.acodec === 'opus';
     const proc = ytDlp.exec(url, {
       output: '-',
+      ...strategy,
       format: info.format_id,
       noPlaylist: true,
       noWarnings: true,
@@ -307,6 +350,10 @@ function handleTrackEnd(guildId, client, track, startedAt, retriesLeft) {
 
   if (retriesLeft > 0) {
     console.warn(`[PLAYER] ${guildId} "${track.title}" stopped after only ${elapsedMs}ms — retrying (${retriesLeft} attempt${retriesLeft === 1 ? '' : 's'} left).`);
+    // Move to the next YouTube client strategy — metadata can succeed while
+    // the download itself still fails, so repeating the same strategy would
+    // just hit the same dead end again.
+    track._strategyIndex = ((track._strategyIndex ?? 0) + 1) % YT_CLIENT_STRATEGIES.length;
     setTimeout(() => {
       playNext(guildId, client, track, retriesLeft - 1).catch(console.error);
     }, TRACK_RETRY_DELAY_MS);
@@ -416,14 +463,9 @@ export async function execute(interaction, client) {
   if (!isRawURL) {
     // Text search → single YouTube video
     try {
-      const [hit] = await play.search(query, { source: { youtube: 'video' }, limit: 1 });
+      const hit = await searchYoutube(query);
       if (!hit) return interaction.editReply(`❌ No results found for **${query}**.`);
-      tracks.push({
-        url: hit.url,
-        title: hit.title ?? query,
-        thumbnail: hit.thumbnails?.[0]?.url ?? null,
-        requester,
-      });
+      tracks.push({ ...hit, requester });
     } catch (err) {
       console.error('Search error:', err);
       return interaction.editReply('❌ YouTube search failed. Try pasting a direct URL instead.');

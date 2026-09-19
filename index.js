@@ -25,7 +25,16 @@ try {
   const result = await ytDlp(undefined, { update: true });
   console.log(`✅ yt-dlp: ${result.trim().split('\n').pop()}`);
 } catch (err) {
-  console.warn('⚠️  yt-dlp self-update check failed (continuing with current version):', err.shortMessage || err.message);
+  // yt-dlp exits 100 specifically after it *successfully* replaces its own
+  // binary on disk, as a "restart to pick up the new build" signal — not a
+  // real failure. Since every actual download spawns a brand-new process,
+  // the replaced binary is already in effect for the very next yt-dlp call.
+  if (err.exitCode === 100) {
+    const line = (err.stdout || '').trim().split('\n').pop();
+    console.log(`✅ yt-dlp: ${line || 'updated to latest'}`);
+  } else {
+    console.warn('⚠️  yt-dlp self-update check failed (continuing with current version):', err.shortMessage || err.message);
+  }
 }
 
 // Allow play-dl to resolve YouTube stream URLs for more videos.
