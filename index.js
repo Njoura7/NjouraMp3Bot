@@ -1,11 +1,32 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events, Collection, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, Events, Collection, MessageFlags, ActivityType } from 'discord.js';
 import { readdirSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import play from 'play-dl';
+import ytDlp from 'yt-dlp-exec';
+import { startHealthServer } from './health.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
+
+// Bind the health-check port immediately, before any of the slower startup
+// steps below — a host like Render expects the port open quickly or it
+// considers the deploy failed.
+const healthServer = startHealthServer(client);
+
+// YouTube changes its anti-bot measures often enough that a yt-dlp binary a
+// few months old starts failing downloads with plain HTTP 403s. Self-update
+// on every boot so this doesn't silently regress between deploys.
+try {
+  const result = await ytDlp(undefined, { update: true });
+  console.log(`✅ yt-dlp: ${result.trim().split('\n').pop()}`);
+} catch (err) {
+  console.warn('⚠️  yt-dlp self-update check failed (continuing with current version):', err.shortMessage || err.message);
+}
 
 // Allow play-dl to resolve YouTube stream URLs for more videos.
 // Obtain your cookie from Chrome DevTools → Application → Cookies → youtube.com
@@ -17,13 +38,15 @@ if (process.env.YOUTUBE_COOKIE) {
 
 // play-dl requires a SoundCloud client ID before so_validate / play.stream will work.
 // getFreeClientID() scrapes a working one from soundcloud.com — no account needed.
-const scClientId = await play.getFreeClientID();
-await play.setToken({ soundcloud: { client_id: scClientId } });
-console.log('✅ SoundCloud client ID fetched');
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
-});
+// This is a network call to a third-party site and can fail transiently
+// (e.g. ECONNRESET); don't let that take down YouTube playback too.
+try {
+  const scClientId = await play.getFreeClientID();
+  await play.setToken({ soundcloud: { client_id: scClientId } });
+  console.log('✅ SoundCloud client ID fetched');
+} catch (err) {
+  console.warn('⚠️  Failed to fetch SoundCloud client ID (SoundCloud links will fail until next restart):', err.message);
+}
 
 client.commands = new Collection();
 // Per-guild audio state: guildId → { player, connection, trackTitle, trackUrl }
@@ -39,7 +62,14 @@ for (const file of readdirSync(commandsPath).filter((f) => f.endsWith('.js'))) {
   }
 }
 
-client.once(Events.ClientReady, (c) => console.log(`✅ Logged in as ${c.user.tag}`));
+client.once(Events.ClientReady, (c) => {
+  console.log(`✅ Logged in as ${c.user.tag}`);
+
+  // Set via the host's dashboard (e.g. Render env vars) — leave unset locally.
+  if (process.env.LOW_PRIORITY_HOSTING === 'true') {
+    c.user.setActivity('⚡ free-tier server — may lag', { type: ActivityType.Watching });
+  }
+});
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
@@ -87,6 +117,8 @@ async function shutdownBot(signal) {
   }
 
   client.players.clear();
+
+  try { healthServer.close(); } catch {}
 
   try {
     await client.destroy();

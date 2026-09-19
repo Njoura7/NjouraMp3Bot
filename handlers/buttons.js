@@ -39,6 +39,7 @@ export async function handle(interaction, client) {
     case 'stop': {
       try { state.player.stop(true); } catch {}
       try { state.connection.destroy(); } catch {}
+      try { state.playlistProc?.kill(); } catch {}
       client.players.delete(interaction.guildId);
       await interaction.update({ content: '⏹️ Stopped.', embeds: [], components: [] });
       break;

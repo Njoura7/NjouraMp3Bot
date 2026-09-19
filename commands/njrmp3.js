@@ -18,6 +18,50 @@ import {
 } from '@discordjs/voice';
 import play from 'play-dl';
 import ytDlp from 'yt-dlp-exec';
+import { createInterface } from 'node:readline';
+import { writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// ── yt-dlp authentication ─────────────────────────────────────────────────────
+// YOUTUBE_COOKIE (already used for play-dl's search) is a raw "name=value;
+// name2=value2" header. yt-dlp needs a Netscape-format cookies.txt instead —
+// convert it once and cache the path. Without this, every yt-dlp request is
+// anonymous, which YouTube throttles hard after a few rapid successive calls
+// (exactly what happens once the queue starts advancing track to track).
+
+let ytDlpCookiesFile;
+
+function getYtDlpCookiesFile() {
+  if (ytDlpCookiesFile !== undefined) return ytDlpCookiesFile;
+
+  const raw = process.env.YOUTUBE_COOKIE;
+  if (!raw) {
+    ytDlpCookiesFile = null;
+    return null;
+  }
+
+  const expiry = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365;
+  const lines = ['# Netscape HTTP Cookie File'];
+  for (const pair of raw.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx === -1) continue;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!name) continue;
+    lines.push(['.youtube.com', 'TRUE', '/', 'TRUE', String(expiry), name, value].join('\t'));
+  }
+
+  const file = join(tmpdir(), `njrmp3-yt-cookies-${process.pid}.txt`);
+  writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
+  ytDlpCookiesFile = file;
+  return file;
+}
+
+function ytCookieFlags() {
+  const file = getYtDlpCookiesFile();
+  return file ? { cookies: file } : {};
+}
 
 export const data = new SlashCommandBuilder()
   .setName('njrmp3')
@@ -30,6 +74,16 @@ export const data = new SlashCommandBuilder()
   );
 
 // ── Embed & button builders ───────────────────────────────────────────────────
+
+// Set LOW_PRIORITY_HOSTING=true on the host's dashboard (e.g. Render free
+// tier) to disclose that this is running on shared, resource-limited hosting.
+// Leave unset locally so dev runs stay clean.
+const LOW_PRIORITY_NOTE = '  ·  🐢 free-tier server — thanks for your patience';
+
+function footerText(username) {
+  const base = `✦ NJR  ·  ${username}`;
+  return process.env.LOW_PRIORITY_HOSTING === 'true' ? `${base}${LOW_PRIORITY_NOTE}` : base;
+}
 
 function buildEmbed(state) {
   const { current, queue, voiceChannelName } = state;
@@ -55,7 +109,7 @@ function buildEmbed(state) {
       `\`▬▬▬◉─────────────────────\``,
     )
     .setFooter({
-      text: `✦ NJR  ·  ${current.requester.username}`,
+      text: footerText(current.requester.username),
       iconURL: current.requester.avatarURL,
     })
     .setTimestamp();
@@ -79,10 +133,97 @@ function clearGuildState(client, guildId) {
 
   try { state.player?.stop(true); } catch {}
   try { state.connection?.destroy(); } catch {}
+  try { state.playlistProc?.kill(); } catch {}
   client.players.delete(guildId);
 }
 
+// ── Playlist/mix streaming ────────────────────────────────────────────────────
+// Large YouTube Mixes can take many minutes to fully paginate, so we don't wait
+// for the whole listing: --lazy-playlist lets yt-dlp print each entry as it's
+// found, so we can start playback after the first one and load the rest in the
+// background instead of blocking the command on the entire playlist.
+
+function entryToTrack(line, requester) {
+  const entry = JSON.parse(line);
+  const url = /^https?:\/\//.test(entry.url ?? '')
+    ? entry.url
+    : `https://www.youtube.com/watch?v=${entry.id}`;
+  return { url, title: entry.title ?? 'Unknown Track', thumbnail: entry.thumbnail ?? null, requester };
+}
+
+function streamPlaylist(query) {
+  const proc = ytDlp.exec(query, {
+    flatPlaylist: true,
+    lazyPlaylist: true,
+    dumpJson: true,
+    noWarnings: true,
+    noCheckCertificates: true,
+    ...ytCookieFlags(),
+  });
+  const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
+  return { proc, rl, iterator: rl[Symbol.asyncIterator]() };
+}
+
+async function loadRemainingPlaylistTracks(guildId, client, playlist, requester, targetState) {
+  const { proc, rl, iterator } = playlist;
+  let appended = 0;
+  try {
+    while (true) {
+      const { value: line, done } = await iterator.next();
+      if (done) break;
+      if (!line.trim()) continue;
+
+      const liveState = client.players.get(guildId);
+      if (liveState !== targetState) break; // session ended/replaced — stop loading
+
+      let track;
+      try { track = entryToTrack(line, requester); } catch { continue; }
+      liveState.queue.push(track);
+      appended += 1;
+
+      if (appended % 10 === 0 && liveState.nowPlayingMessage) {
+        try {
+          await liveState.nowPlayingMessage.edit({
+            embeds: [buildEmbed(liveState)],
+            components: [buildRow(liveState.queue.length)],
+          });
+        } catch {}
+      }
+    }
+  } catch (err) {
+    console.error(`[PLAYLIST] ${guildId} background load error:`, err);
+  } finally {
+    try { rl.close(); } catch {}
+    try { proc.kill(); } catch {}
+    const liveState = client.players.get(guildId);
+    if (liveState === targetState) {
+      if (liveState.playlistProc === proc) liveState.playlistProc = null;
+      if (liveState.nowPlayingMessage) {
+        try {
+          await liveState.nowPlayingMessage.edit({
+            embeds: [buildEmbed(liveState)],
+            components: [buildRow(liveState.queue.length)],
+          });
+        } catch {}
+      }
+    }
+  }
+}
+
 // ── Audio resource factory ────────────────────────────────────────────────────
+
+// yt-dlp's download process is piped straight into createAudioResource and its
+// stderr/exit code were never inspected, so failures (e.g. an HTTP 403 from
+// YouTube) surfaced only as a silent, unexplained Idle a couple seconds later.
+// Capture stderr and log the real reason instead of dropping it.
+function logDownloadFailure(track, proc) {
+  let stderr = '';
+  proc.stderr?.on('data', (d) => { stderr += d; });
+  proc.catch((err) => {
+    const reason = stderr.trim().split('\n').filter(Boolean).pop() || err.shortMessage || err.message;
+    console.error(`[YT-DLP] download failed for "${track.title}": ${reason}`);
+  });
+}
 
 async function createResource(track) {
   const { url } = track;
@@ -99,6 +240,7 @@ async function createResource(track) {
       noCheckCertificates: true,
       noPlaylist: true,
       format: 'bestaudio[ext=webm][acodec=opus]/bestaudio[ext=webm]/bestaudio',
+      ...ytCookieFlags(),
     });
     if (!track.title || track.title === 'Unknown Track') track.title = info.title ?? track.title;
     if (!track.thumbnail) track.thumbnail = info.thumbnail ?? null;
@@ -110,7 +252,9 @@ async function createResource(track) {
       noPlaylist: true,
       noWarnings: true,
       noCheckCertificates: true,
+      ...ytCookieFlags(),
     });
+    logDownloadFailure(track, proc);
     return createAudioResource(proc.stdout, {
       inputType: isNativeOpus ? StreamType.WebmOpus : StreamType.Arbitrary,
     });
@@ -132,6 +276,7 @@ async function createResource(track) {
       noWarnings: true,
       noCheckCertificates: true,
     });
+    logDownloadFailure(track, proc);
     return createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary });
   }
 
@@ -144,11 +289,47 @@ async function createResource(track) {
 
 // ── Queue advance ─────────────────────────────────────────────────────────────
 
-async function playNext(guildId, client) {
+// @discordjs/voice silently drops the player to Idle (no 'error' event) when a
+// resource's stream ends/closes before ever becoming readable. YouTube's CDN
+// token checks are flaky enough that the very same track can 403 and then
+// succeed moments later, so a short-lived playback gets a few retries before
+// we give up and move on to the next track.
+const SHORT_PLAYBACK_MS = 5000;
+const MAX_TRACK_RETRIES = 2;
+const TRACK_RETRY_DELAY_MS = 1500;
+
+function handleTrackEnd(guildId, client, track, startedAt, retriesLeft) {
+  const elapsedMs = Date.now() - startedAt;
+  if (elapsedMs >= SHORT_PLAYBACK_MS) {
+    playNext(guildId, client).catch(console.error);
+    return;
+  }
+
+  if (retriesLeft > 0) {
+    console.warn(`[PLAYER] ${guildId} "${track.title}" stopped after only ${elapsedMs}ms — retrying (${retriesLeft} attempt${retriesLeft === 1 ? '' : 's'} left).`);
+    setTimeout(() => {
+      playNext(guildId, client, track, retriesLeft - 1).catch(console.error);
+    }, TRACK_RETRY_DELAY_MS);
+    return;
+  }
+
+  console.warn(`[PLAYER] ${guildId} "${track.title}" stopped after only ${elapsedMs}ms — giving up after retries, skipping to next track.`);
+  playNext(guildId, client).catch(console.error);
+}
+
+async function playNext(guildId, client, retryTrack = null, retriesLeft = MAX_TRACK_RETRIES) {
   const state = client.players.get(guildId);
   if (!state) return;
 
-  const next = state.queue.shift();
+  let next = retryTrack ?? state.queue.shift();
+
+  // A background playlist load may still be streaming in more tracks —
+  // wait for it instead of declaring the queue empty prematurely.
+  while (!next && state.playlistProc) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (client.players.get(guildId) !== state) return; // session ended while waiting
+    next = state.queue.shift();
+  }
 
   if (!next) {
     // Queue exhausted — leave channel and mark embed as finished
@@ -176,15 +357,23 @@ async function playNext(guildId, client) {
   try {
     resource = await createResource(next);
   } catch (err) {
-    console.error(`[PLAYER] ${guildId} failed to load "${next.title}":`, err);
+    if (retriesLeft > 0) {
+      console.warn(`[PLAYER] ${guildId} failed to load "${next.title}" (${err.message}) — retrying (${retriesLeft} attempt${retriesLeft === 1 ? '' : 's'} left).`);
+      setTimeout(() => {
+        playNext(guildId, client, next, retriesLeft - 1).catch(console.error);
+      }, TRACK_RETRY_DELAY_MS);
+      return;
+    }
+    console.error(`[PLAYER] ${guildId} failed to load "${next.title}" after retries:`, err);
     return playNext(guildId, client); // skip broken track, try next
   }
 
   state.player.play(resource);
+  const startedAt = Date.now();
 
   // Register the next advance before editing the message so there is no gap
   state.player.once(AudioPlayerStatus.Idle, () => {
-    playNext(guildId, client).catch(console.error);
+    handleTrackEnd(guildId, client, next, startedAt, retriesLeft);
   });
 
   if (state.nowPlayingMessage) {
@@ -222,6 +411,7 @@ export async function execute(interaction, client) {
   const isRawURL = /^https?:\/\//.test(query);
   const requester = { username: member.user.username, avatarURL: member.user.displayAvatarURL() };
   let tracks = [];
+  let backgroundPlaylist = null;
 
   if (!isRawURL) {
     // Text search → single YouTube video
@@ -255,31 +445,32 @@ export async function execute(interaction, client) {
 
     if (isYT && (isRadioMix || (hasList && !hasVideo))) {
       // ── YouTube playlist or radio mix ────────────────────────────────────────
+      // Large mixes can take minutes to fully paginate, so only wait for the
+      // first entry here; the rest streams into the queue in the background
+      // (see backgroundPlaylist below) once playback has started.
       await interaction.editReply('⏳ Loading playlist…');
+      const playlist = streamPlaylist(query);
+      let firstTrack = null;
       try {
-        const info = await ytDlp(query, {
-          dumpSingleJson: true,
-          flatPlaylist: true,
-          noWarnings: true,
-          noCheckCertificates: true,
-        });
-        for (const e of info.entries ?? []) {
-          const vUrl = /^https?:\/\//.test(e.url ?? '')
-            ? e.url
-            : `https://www.youtube.com/watch?v=${e.id}`;
-          tracks.push({
-            url: vUrl,
-            title: e.title ?? 'Unknown Track',
-            thumbnail: e.thumbnail ?? null,
-            requester,
-          });
+        while (true) {
+          const { value: line, done } = await playlist.iterator.next();
+          if (done) break;
+          if (!line.trim()) continue;
+          try { firstTrack = entryToTrack(line, requester); } catch { continue; }
+          break;
         }
       } catch (err) {
         console.error('Playlist fetch error:', err);
       }
-      if (tracks.length === 0) {
+
+      if (!firstTrack) {
+        try { playlist.rl.close(); } catch {}
+        try { playlist.proc.kill(); } catch {}
         return interaction.editReply('❌ Playlist is empty or unavailable.');
       }
+
+      tracks.push(firstTrack);
+      backgroundPlaylist = playlist;
 
     } else if (isYT) {
       // ── Single YouTube video (strip any playlist sidebar params) ─────────────
@@ -325,6 +516,11 @@ export async function execute(interaction, client) {
       : activeState.current?.title ?? '…';
     activeState.queue.push(...tracks);
 
+    if (backgroundPlaylist) {
+      activeState.playlistProc = backgroundPlaylist.proc;
+      loadRemainingPlaylistTracks(interaction.guildId, client, backgroundPlaylist, requester, activeState).catch(console.error);
+    }
+
     // Update the live now-playing embed to reflect the updated queue
     if (activeState.nowPlayingMessage) {
       try {
@@ -348,7 +544,7 @@ export async function execute(interaction, client) {
               : `**📋  Added to Queue**\n╰  ${count} tracks will play after **${playAfter}**`) +
             `\n\n▶  Now playing: **${activeState.current?.title ?? '…'}**`,
           )
-          .setFooter({ text: `✦ NJR  ·  ${member.user.username}`, iconURL: member.user.displayAvatarURL() })
+          .setFooter({ text: footerText(member.user.username), iconURL: member.user.displayAvatarURL() })
           .setTimestamp(),
       ],
     });
@@ -358,11 +554,23 @@ export async function execute(interaction, client) {
   const first = tracks.shift(); // first track plays now, rest go to queue
 
   let resource;
-  try {
-    resource = await createResource(first);
-  } catch (err) {
-    console.error('Stream error:', err);
-    return interaction.editReply(`❌ Failed to load audio: \`${err.message}\``);
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_TRACK_RETRIES; attempt++) {
+    try {
+      resource = await createResource(first);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_TRACK_RETRIES) {
+        console.warn(`[PLAYER] ${interaction.guildId} failed to load "${first.title}" (${err.message}) — retrying.`);
+        await new Promise((resolve) => setTimeout(resolve, TRACK_RETRY_DELAY_MS));
+      }
+    }
+  }
+  if (lastErr) {
+    console.error('Stream error:', lastErr);
+    return interaction.editReply(`❌ Failed to load audio: \`${lastErr.message}\``);
   }
 
   // Join voice channel
@@ -392,8 +600,13 @@ export async function execute(interaction, client) {
     current: first,
     voiceChannelName: voiceChannel.name,
     nowPlayingMessage: null,
+    playlistProc: backgroundPlaylist?.proc ?? null,
   };
   client.players.set(interaction.guildId, state);
+
+  if (backgroundPlaylist) {
+    loadRemainingPlaylistTracks(interaction.guildId, client, backgroundPlaylist, requester, state).catch(console.error);
+  }
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
@@ -410,10 +623,11 @@ export async function execute(interaction, client) {
   state.player = player;
   connection.subscribe(player);
   player.play(resource);
+  const startedAt = Date.now();
 
   // Each track hands off to the next via the Idle event
   player.once(AudioPlayerStatus.Idle, () => {
-    playNext(interaction.guildId, client).catch(console.error);
+    handleTrackEnd(interaction.guildId, client, first, startedAt, MAX_TRACK_RETRIES);
   });
 
   player.on('error', (err) => {
